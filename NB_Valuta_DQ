@@ -1,0 +1,327 @@
+# =================================================================
+# DATAKVALITET: Frekvens- og hull-sjekk av bronse.valutakurs
+# =================================================================
+# Denne notebooken sjekker datakvaliteten i bronse-tabellen
+# test_dab.bronse.valutakurs og logger eventuelle avvik til en
+# egen DQ-tabell (test_dab.bronse.valutakurs_dq).
+#
+# TO SJEKKER KJØRES:
+#
+#   SJEKK 1 (FREKVENS):  Verifiserer at antall kursnoteringer per
+#                         uke per valuta stemmer med antall forventede
+#                         hverdager (mandag-fredag) den uken. En uke
+#                         med 5 hverdager skal ha 5 rader per valuta.
+#
+#   SJEKK 2 (HULL):      Finner konkrete datoer som mangler for hver
+#                         valuta ved å sammenligne alle faktiske datoer
+#                         mot alle forventede hverdager i perioden
+#                         tabellen dekker. Helligdager er ikke hensyntatt
+#                         (Norges Bank publiserer ikke kurs på helligdager,
+#                         men vi mangler en helligdagskalender å sjekke mot
+#                         - disse vil derfor dukke opp som forventede hull
+#                         og kan filtreres manuelt).
+#
+# RESULTAT:
+#   - Avvik skrives til test_dab.bronse.valutakurs_dq (Delta-tabell)
+#   - Jobben fortsetter uansett (ingen exception kastes)
+#   - Kjøres ideelt sett etter hovedjobben (valutakurs_full_jobb_merge)
+#     i samme Databricks Workflow, som et eget Task
+#
+# HELLIGDAGER:
+#   Norges Bank publiserer ikke kurs på norske helligdager. Disse
+#   vil foreløpig dukke opp som "manglende hverdager" i hull-sjekken.
+#   Fremtidig forbedring: legg til en helligdagskalender for å filtrere
+#   disse ut av avvikslisten automatisk.
+# =================================================================
+
+
+# -----------------------------------------------------------------
+# DEL 0: IMPORTER
+# -----------------------------------------------------------------
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import (
+    StructType, StructField, StringType, DateType,
+    IntegerType, TimestampType
+)
+from datetime import datetime, date, timedelta
+
+
+# -----------------------------------------------------------------
+# DEL 1: KONFIGURASJON
+# -----------------------------------------------------------------
+KATALOG       = "test_dab"
+BRONSE_SKJEMA = "bronse"
+KILDE_TABELL  = f"{KATALOG}.{BRONSE_SKJEMA}.valutakurs"
+DQ_TABELL     = f"{KATALOG}.{BRONSE_SKJEMA}.valutakurs_dq"
+
+# Tidspunkt sjekken kjøres - brukes som sporingskolonne i DQ-tabellen
+SJEKK_TIDSPUNKT = datetime.now()
+
+print("=" * 65)
+print("DATAKVALITETSSJEKK: valutakurs")
+print("=" * 65)
+print(f"Kilde:          {KILDE_TABELL}")
+print(f"DQ-tabell:      {DQ_TABELL}")
+print(f"Sjekk kjørt:    {SJEKK_TIDSPUNKT.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+# -----------------------------------------------------------------
+# DEL 2: SIKRE AT DQ-TABELLEN FINNES
+# -----------------------------------------------------------------
+# DQ-tabellen opprettes automatisk ved første kjøring hvis den ikke
+# finnes fra før. Skjemaet er fast og endres ikke over tid, siden
+# alle sjekk-typer bruker samme kolonnestruktur.
+# -----------------------------------------------------------------
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {DQ_TABELL} (
+        sjekk_type          STRING  COMMENT 'Type DQ-sjekk: FREKVENS eller HULL',
+        valuta              STRING  COMMENT 'Valutakoden avviket gjelder for',
+        periode             STRING  COMMENT 'Uke (FREKVENS) eller konkret dato (HULL) avviket gjelder for',
+        forventet           INT     COMMENT 'Forventet antall rader (FREKVENS) eller 1 = dato forventes å finnes (HULL)',
+        faktisk             INT     COMMENT 'Faktisk antall rader funnet i tabellen',
+        avvik               INT     COMMENT 'Differansen mellom forventet og faktisk (forventet - faktisk)',
+        beskrivelse         STRING  COMMENT 'Lesbar forklaring på avviket',
+        sjekk_tidspunkt     TIMESTAMP COMMENT 'Når denne DQ-sjekken ble kjørt'
+    )
+    USING DELTA
+    COMMENT 'Datakvalitetslogg for bronse.valutakurs. Inneholder avvik fra frekvens- og hull-sjekker.'
+""")
+
+print("\n✅ DQ-tabell verifisert/opprettet.")
+
+
+# -----------------------------------------------------------------
+# DEL 3: LAST KILDETABELLEN
+# -----------------------------------------------------------------
+df = spark.table(KILDE_TABELL)
+
+# Hent første og siste dato i tabellen - brukes som grense for
+# hvilken periode vi genererer forventede hverdager for
+periode = df.agg(
+    F.min("dato").alias("tidligste_dato"),
+    F.max("dato").alias("seneste_dato")
+).collect()[0]
+
+TIDLIGSTE_DATO = periode["tidligste_dato"]
+SENESTE_DATO   = periode["seneste_dato"]
+VALUTAER       = [r["valuta"] for r in df.select("valuta").distinct().collect()]
+
+print(f"\nPeriode i tabellen: {TIDLIGSTE_DATO} til {SENESTE_DATO}")
+print(f"Valutaer funnet:    {', '.join(VALUTAER)}")
+
+
+# ===================================================================
+# SJEKK 1: FREKVENSSJEKK
+# ===================================================================
+# For hver valuta og uke: tell antall kursnoteringer og sammenlign
+# med antall forventede hverdager (mandag-fredag) i den uken.
+#
+# Eksempel: en uke med 5 hverdager skal ha 5 rader per valuta.
+# En uke med kun 3 registrerte datoer vil gi avvik = 2 (5 - 3 = 2).
+#
+# Merk: helligdager er ikke hensyntatt - en uke med en helligdag
+# vil gi avvik = 1 selv om Norges Bank korrekt ikke publiserte kurs.
+# ===================================================================
+print("\n" + "=" * 65)
+print("SJEKK 1: FREKVENS (forventede hverdager per uke per valuta)")
+print("=" * 65)
+
+# Bygg en DataFrame med alle forventede hverdager i perioden
+alle_hverdager = []
+gjeldende = TIDLIGSTE_DATO
+while gjeldende <= SENESTE_DATO:
+    # weekday(): 0=mandag, 4=fredag, 5=lørdag, 6=søndag
+    if gjeldende.weekday() < 5:
+        alle_hverdager.append((gjeldende,))
+    gjeldende += timedelta(days=1)
+
+forventede_df = spark.createDataFrame(
+    alle_hverdager, schema=["dato"]
+).withColumn("dato", F.col("dato").cast("date"))
+
+# Tell forventede hverdager per uke
+forventede_per_uke = (forventede_df
+    .withColumn("aar_uke", F.concat(F.expr("year(dato)").cast("string"), F.lit("-"), F.lpad(F.weekofyear("dato").cast("string"), 2, "0")))
+    .groupBy("aar_uke")
+    .agg(F.count("*").alias("forventede_hverdager"))
+)
+
+# Tell faktiske rader per valuta per uke
+faktiske_per_uke = (df
+    .withColumn("aar_uke", F.concat(F.expr("year(dato)").cast("string"), F.lit("-"), F.lpad(F.weekofyear("dato").cast("string"), 2, "0")))
+    .groupBy("valuta", "aar_uke")
+    .agg(F.count("*").alias("faktiske_rader"))
+)
+
+# Krysskombiner alle valutaer med alle uker for å fange manglende uker
+alle_kombinasjoner = (forventede_per_uke
+    .crossJoin(spark.createDataFrame(
+        [(v,) for v in VALUTAER], schema=["valuta"]
+    ))
+)
+
+# Join og finn avvik
+frekvens_avvik = (alle_kombinasjoner
+    .join(faktiske_per_uke, ["valuta", "aar_uke"], "left")
+    .withColumn("faktiske_rader", F.coalesce(F.col("faktiske_rader"), F.lit(0)))
+    .withColumn("avvik", F.col("forventede_hverdager") - F.col("faktiske_rader"))
+    .filter(F.col("avvik") != 0)
+)
+
+antall_frekvens_avvik = frekvens_avvik.count()
+print(f"Frekvensavvik funnet: {antall_frekvens_avvik}")
+
+if antall_frekvens_avvik > 0:
+    frekvens_avvik.select("valuta", "aar_uke", "forventede_hverdager", "faktiske_rader", "avvik") \
+        .orderBy("valuta", "aar_uke") \
+        .show(20, truncate=False)
+
+
+# ===================================================================
+# SJEKK 2: HULL-SJEKK
+# ===================================================================
+# For hver valuta: finn konkrete datoer som er forventet (hverdag)
+# men som ikke finnes i tabellen.
+#
+# Fremgangsmåte:
+#   1. Generer alle forventede hverdager i perioden (mandag-fredag)
+#   2. Krysskombiner med alle valutaer
+#   3. LEFT JOIN mot faktiske data
+#   4. Rader uten match er hull
+# ===================================================================
+print("\n" + "=" * 65)
+print("SJEKK 2: HULL (manglende datoer per valuta)")
+print("=" * 65)
+
+# Krysskombiner forventede hverdager med alle valutaer
+forventede_kombinasjoner = (forventede_df
+    .crossJoin(spark.createDataFrame(
+        [(v,) for v in VALUTAER], schema=["valuta"]
+    ))
+)
+
+# Finn hull (forventede datoer som ikke finnes i tabellen)
+hull_df = (forventede_kombinasjoner
+    .join(
+        df.select("valuta", "dato"),
+        ["valuta", "dato"],
+        "left_anti"  # left_anti returnerer kun rader som IKKE fant match
+    )
+    .withColumn("avvik", F.lit(1))
+    .orderBy("valuta", "dato")
+)
+
+antall_hull = hull_df.count()
+print(f"Hull funnet: {antall_hull}")
+
+if antall_hull > 0:
+    hull_df.show(20, truncate=False)
+    print("\nNB: Merk at norske helligdager (der Norges Bank ikke")
+    print("    publiserer kurs) foreløpig vil vises som hull her.")
+
+
+# ===================================================================
+# DEL 4: SKRIV AVVIK TIL DQ-TABELLEN
+# ===================================================================
+# Alle avvik fra begge sjekker samles i én DataFrame og skrives til
+# DQ-tabellen via MERGE INTO på (sjekk_type, valuta, periode,
+# sjekk_tidspunkt), slik at gjentatte kjøringer ikke lager
+# duplikate rader for samme sjekk-tidspunkt.
+# ===================================================================
+print("\n" + "=" * 65)
+print("DEL 4: Skriver avvik til DQ-tabellen")
+print("=" * 65)
+
+from delta.tables import DeltaTable
+
+avvik_rader = []
+
+# --- Samle frekvensavvik ---
+for rad in frekvens_avvik.collect():
+    avvik_rader.append((
+        "FREKVENS",
+        rad["valuta"],
+        rad["aar_uke"],
+        int(rad["forventede_hverdager"]),
+        int(rad["faktiske_rader"]),
+        int(rad["avvik"]),
+        (f"Uke {rad['aar_uke']}: forventet {rad['forventede_hverdager']} "
+         f"kursnoteringer for {rad['valuta']}, fant {rad['faktiske_rader']}. "
+         f"Avvik: {rad['avvik']} manglende dag(er)."),
+        SJEKK_TIDSPUNKT,
+    ))
+
+# --- Samle hull-avvik ---
+for rad in hull_df.collect():
+    avvik_rader.append((
+        "HULL",
+        rad["valuta"],
+        str(rad["dato"]),
+        1,
+        0,
+        1,
+        (f"Manglende kursnotering for {rad['valuta']} "
+         f"på hverdag {rad['dato']}. "
+         f"Kan skyldes norsk helligdag (ikke filtrert bort ennå)."),
+        SJEKK_TIDSPUNKT,
+    ))
+
+if avvik_rader:
+    avvik_schema = StructType([
+        StructField("sjekk_type",      StringType(),    False),
+        StructField("valuta",          StringType(),    False),
+        StructField("periode",         StringType(),    False),
+        StructField("forventet",       IntegerType(),   True),
+        StructField("faktisk",         IntegerType(),   True),
+        StructField("avvik",           IntegerType(),   True),
+        StructField("beskrivelse",     StringType(),    True),
+        StructField("sjekk_tidspunkt", TimestampType(), False),
+    ])
+
+    avvik_df = spark.createDataFrame(avvik_rader, schema=avvik_schema)
+
+    # MERGE på (sjekk_type, valuta, periode, sjekk_tidspunkt) for å
+    # unngå duplikater ved gjentatte kjøringer i samme tidspunkt-vindu
+    dq_tabell = DeltaTable.forName(spark, DQ_TABELL)
+    (dq_tabell.alias("mål")
+        .merge(
+            avvik_df.alias("kilde"),
+            """`mål`.sjekk_type      = kilde.sjekk_type
+            AND `mål`.valuta          = kilde.valuta
+            AND `mål`.periode         = kilde.periode
+            AND `mål`.sjekk_tidspunkt = kilde.sjekk_tidspunkt"""
+        )
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+    print(f"✅ {len(avvik_rader)} avvik skrevet til {DQ_TABELL}.")
+else:
+    print("✅ Ingen avvik funnet — ingen rader skrevet til DQ-tabellen.")
+
+
+# -----------------------------------------------------------------
+# DEL 5: OPPSUMMERING
+# -----------------------------------------------------------------
+print("\n" + "=" * 65)
+print("OPPSUMMERING")
+print("=" * 65)
+print(f"Periode sjekket:       {TIDLIGSTE_DATO} til {SENESTE_DATO}")
+print(f"Valutaer:              {', '.join(VALUTAER)}")
+print(f"Frekvensavvik funnet:  {antall_frekvens_avvik}")
+print(f"Hull funnet:           {antall_hull}")
+print(f"Totalt avvik logget:   {len(avvik_rader)}")
+
+if len(avvik_rader) > 0:
+    print(f"\n⚠️ Avvik er logget til {DQ_TABELL}.")
+    print("   Spørr mot tabellen for å se detaljer:")
+    print(f"   SELECT * FROM {DQ_TABELL}")
+    print(f"   WHERE DATE(sjekk_tidspunkt) = '{date.today()}'")
+    print(f"   ORDER BY sjekk_type, valuta, periode;")
+else:
+    print("\n✅ Alle sjekker passerte uten avvik.")
+
+print("\n" + "=" * 65)
+print("DATAKVALITETSSJEKK FULLFØRT")
+print("=" * 65)
