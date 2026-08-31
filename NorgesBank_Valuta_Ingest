@@ -1,32 +1,23 @@
 # =================================================================
-# JOBB-STEG 1/2: Valutakurser — EXTRACT til landing-sonen
+# TASK 1/2: Henter valutakurser fra Norges Bank → landing-sonen
+# Neste task (DLT-pipelinen) leser landing-sonen og skriver til bronse.
 # =================================================================
-# Dette er original-jobbens STEG 1, trimmet til å KUN gjøre ekstraksjon.
-# Kjøres som første Task i en Databricks Job, FØR DLT-pipelinen
-# (dlt_pipeline_valutakurs.py) som er neste Task i samme jobb.
-#
-# STEG 2-4 (Autoloader-lesing, flatening, MERGE, kolonnekommentarer
-# og sensitivitets-tag) eies nå av DLT-pipelinen selv - se DEL 5/6-
-# kommentaren nederst for hvordan de to gjenværende bitene (metadata-
-# kommentarer og tag) håndteres når skrivingen skjer via DLT.
-#
-# MÅLTABELL (kun for AUTO-deteksjon av lastetype, se DEL 4):
-# {KATALOG}.dlt_bronse.valutakurs
-# =================================================================
-
 import requests
 import json
 from datetime import date, datetime, timedelta
 
+# -----------------------------------------------------------------
+# DEL 1: PARAMETERE
+# -----------------------------------------------------------------
 
-# -----------------------------------------------------------------
-# DEL 1: PARAMETER — lastetype
-# -----------------------------------------------------------------
+# Bruker dropdown slik at lastetype kan velges manuelt ved behov.
+# Default er "full" — trygt for første kjøring.
 dbutils.widgets.dropdown(
     "lastetype", "full", ["auto", "inkrementell", "full"], "Lastetype"
 )
 LASTETYPE_PARAMETER = dbutils.widgets.get("lastetype").strip().lower()
 
+# Feiler tidlig — ugyldig verdi skal ikke komme gjennom til extract.
 if LASTETYPE_PARAMETER not in ("auto", "inkrementell", "full"):
     raise ValueError(
         f"Ugyldig lastetype: '{LASTETYPE_PARAMETER}'. "
@@ -35,10 +26,7 @@ if LASTETYPE_PARAMETER not in ("auto", "inkrementell", "full"):
 
 print(f"ℹ️ Parameter 'lastetype' satt til: '{LASTETYPE_PARAMETER}'")
 
-
-# -----------------------------------------------------------------
-# DEL 1b: ØVRIGE PARAMETERE
-# -----------------------------------------------------------------
+# Kommaseparert liste — gjør det enkelt å legge til nye valutaer uten kodeendring.
 dbutils.widgets.text("valutaer", "EUR,SEK,USD", "Valutaer (kommaseparert)")
 VALUTAER_PARAMETER = dbutils.widgets.get("valutaer").strip()
 VALUTAER = [v.strip().upper() for v in VALUTAER_PARAMETER.split(",") if v.strip()]
@@ -49,6 +37,7 @@ if not VALUTAER:
         "Må være en kommaseparert liste, f.eks. 'EUR,SEK,USD'."
     )
 
+# Brukes kun ved full last — angir hvor langt tilbake vi henter historikk.
 dbutils.widgets.text("full_start_periode", "2026-01-01", "Full last - startdato")
 FULL_START_PERIODE = dbutils.widgets.get("full_start_periode").strip()
 
@@ -60,160 +49,175 @@ except ValueError:
         "Må være på format 'YYYY-MM-DD', f.eks. '2026-01-01'."
     )
 
+# Katalog-parameteren gjør notebooken miljø-agnostisk (dev/test/prod).
 dbutils.widgets.text("katalog", "test_dab", "Katalog (Unity Catalog)")
 KATALOG = dbutils.widgets.get("katalog").strip()
 
-print(f"ℹ️ Parameter 'valutaer' satt til:           {VALUTAER}")
-print(f"ℹ️ Parameter 'full_start_periode' satt til: '{FULL_START_PERIODE}'")
-print(f"ℹ️ Parameter 'katalog' satt til:            '{KATALOG}'")
+print(f"ℹ️ Valutaer:           {VALUTAER}")
+print(f"ℹ️ Full start-periode: '{FULL_START_PERIODE}'")
+print(f"ℹ️ Katalog:            '{KATALOG}'")
 
 
 # -----------------------------------------------------------------
 # DEL 2: KONFIGURASJON
 # -----------------------------------------------------------------
-# NB: ingen CHECKPOINT_PATH her lenger - DLT-pipelinen eier sitt eget
-# checkpoint internt. Denne notebooken bryr seg kun om landing-sonen.
-# -----------------------------------------------------------------
+
 LANDING_SKJEMA = "landing"
 LANDING_VOLUM  = "valuta"
-BRONSE_SKJEMA  = "dlt_bronse"   
+BRONSE_SKJEMA  = "dlt_bronse"
 BRONSE_TABELL  = "valutakurs"
 
+# Filer landes her — DLT-pipelinen leser fra denne stien via Auto Loader.
 LANDING_PATH = f"/Volumes/{KATALOG}/{LANDING_SKJEMA}/{LANDING_VOLUM}"
-TABELLNAVN   = f"{KATALOG}.{BRONSE_SKJEMA}.{BRONSE_TABELL}"
 
-print("=" * 65)
-print("KONFIGURASJON")
-print("=" * 65)
+# Brukes kun i DEL 4 for å detektere om tabellen finnes (auto-modus).
+# Selve skrivingen til tabellen eies av DLT — ikke denne notebooken.
+TABELLNAVN = f"{KATALOG}.{BRONSE_SKJEMA}.{BRONSE_TABELL}"
+
 print(f"LANDING_PATH: {LANDING_PATH}")
-print(f"TABELLNAVN:   {TABELLNAVN}  (eies/skrives av DLT-pipelinen)")
+print(f"TABELLNAVN:   {TABELLNAVN}  (eies av DLT-pipelinen)")
 
 
 # -----------------------------------------------------------------
-# DEL 3: SIKRE AT SKJEMA OG VOLUM FINNES
+# DEL 3: INFRASTRUKTURSJEKK
 # -----------------------------------------------------------------
+
+# Idempotente SQL-kall — trygge å kjøre gjentatte ganger.
+# dlt_bronse-skjemaet opprettes av DLT selv — opprettes bevisst ikke her.
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {KATALOG}.{LANDING_SKJEMA}")
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {KATALOG}.{LANDING_SKJEMA}.{LANDING_VOLUM}")
 dbutils.fs.mkdirs(LANDING_PATH)
 
-print("\n✅ Skjema og volum verifisert/opprettet.")
-# NB: dlt_bronse-schemaet opprettes av DLT-pipelinen selv ved første
-# kjøring (styrt av pipeline-innstillingene "Catalog"/"Target schema"),
-# så det opprettes bevisst IKKE her.
+print("✅ Skjema og volum verifisert/opprettet.")
 
 
 # -----------------------------------------------------------------
-# DEL 4: BESTEM ENDELIG LASTETYPE
+# DEL 4: BESTEM LASTETYPE
 # -----------------------------------------------------------------
+
 if LASTETYPE_PARAMETER in ("inkrementell", "full"):
+    # Eksplisitt valgt — ingen deteksjon nødvendig.
     LASTETYPE = LASTETYPE_PARAMETER
-    print(f"\nℹ️ Lastetype eksplisitt satt via parameter -> '{LASTETYPE.upper()}'.")
-else:  # "auto"
+    print(f"ℹ️ Lastetype eksplisitt satt -> '{LASTETYPE.upper()}'.")
+
+else:  # "auto" — detekter basert på tilstanden til bronse-tabellen.
     tabell_finnes = spark.catalog.tableExists(TABELLNAVN)
 
     if not tabell_finnes:
+        # Tabellen eksisterer ikke ennå — DLT oppretter den på første kjøring.
         LASTETYPE = "full"
-        print(f"\nℹ️ [auto] Tabellen {TABELLNAVN} finnes ikke ennå -> FULL LAST.")
+        print(f"ℹ️ [auto] Tabellen finnes ikke -> FULL LAST.")
     else:
         antall_rader = spark.table(TABELLNAVN).limit(1).count()
         if antall_rader == 0:
+            # Tabellen er opprettet men tom — kjør full last for å fylle den.
             LASTETYPE = "full"
-            print(f"\nℹ️ [auto] Tabellen {TABELLNAVN} er tom -> FULL LAST.")
+            print(f"ℹ️ [auto] Tabellen er tom -> FULL LAST.")
         else:
+            # Tabellen har data — hent kun det som mangler.
             LASTETYPE = "inkrementell"
-            print(f"\nℹ️ [auto] Tabellen {TABELLNAVN} har data -> INKREMENTELL LAST.")
+            print(f"ℹ️ [auto] Tabellen har data -> INKREMENTELL LAST.")
 
 
-# ===================================================================
-# STEG 1 — EXTRACT: Hent valutakurser fra Norges Bank til landing-sonen
-# ===================================================================
-print("\n" + "=" * 65)
-print("STEG 1: EXTRACT -> Landing-sonen")
-print("=" * 65)
+# -----------------------------------------------------------------
+# DEL 5: EXTRACT — hent fra Norges Bank API → landing-sonen
+# -----------------------------------------------------------------
 
 if LASTETYPE == "full":
+    # Full last: hent alt fra fast startdato frem til i dag.
     START_PERIODE = FULL_START_PERIODE
-    print(f"ℹ️ Full last: henter fra fast startdato {START_PERIODE}.")
+    print(f"ℹ️ Full last fra: {START_PERIODE}.")
+
 else:
+    # Inkrementell: finn siste fil i landing-sonen og hent fra dagen etter.
+    # Filnavn-konvensjon: valutakurser_{lastetype}_{DATO}_{timestamp}.json
     eksisterende_filer = [f.name for f in dbutils.fs.ls(LANDING_PATH)] \
         if any(True for _ in dbutils.fs.ls(LANDING_PATH)) else []
 
     siste_dato = None
     for filnavn in eksisterende_filer:
         try:
-            deler = filnavn.split("_")
-            dato_del = deler[2]
+            # Datoer sitter på indeks 2 etter split på "_".
+            dato_del = filnavn.split("_")[2]
             fil_dato = datetime.strptime(dato_del, "%Y-%m-%d").date()
             if siste_dato is None or fil_dato > siste_dato:
                 siste_dato = fil_dato
         except (IndexError, ValueError):
+            # Hopp over filer som ikke følger navnekonvensjonen.
             continue
 
     if siste_dato is None:
+        # Ingen gyldige filer funnet — fall tilbake til full startdato.
         START_PERIODE = FULL_START_PERIODE
         print(f"ℹ️ Ingen tidligere filer funnet. Bruker startdato {START_PERIODE}.")
     else:
+        # Hent fra dagen etter siste kjente dato.
         START_PERIODE = str(siste_dato + timedelta(days=1))
-        print(f"ℹ️ Siste hentede dato funnet: {siste_dato}. Henter fra {START_PERIODE}.")
+        print(f"ℹ️ Siste dato: {siste_dato}. Henter fra: {START_PERIODE}.")
 
 SLUTT_PERIODE = str(date.today())
+
+# Ingen nye perioder å hente — dette er normalt på helger og helligdager.
 HOPP_OVER_EXTRACT = START_PERIODE > SLUTT_PERIODE
 if HOPP_OVER_EXTRACT:
-    print(f"✅ Ingen nye perioder å hente (start {START_PERIODE} > slutt {SLUTT_PERIODE}).")
+    print(f"✅ Ingen nye perioder (start {START_PERIODE} > slutt {SLUTT_PERIODE}).")
 
 if not HOPP_OVER_EXTRACT:
+    # Bygg URL — "+" kombinerer flere valutaer i ett API-kall.
     valuta_str = "+".join(VALUTAER)
     url = f"https://data.norges-bank.no/api/data/EXR/B.{valuta_str}.NOK.SP"
     params = {
-        "startPeriod": START_PERIODE, "endPeriod": SLUTT_PERIODE,
-        "format": "sdmx-json", "locale": "no",
+        "startPeriod": START_PERIODE,
+        "endPeriod":   SLUTT_PERIODE,
+        "format":      "sdmx-json",
+        "locale":      "no",
     }
     response = requests.get(url, params=params)
     print("Hentet URL:", response.url)
 
     if response.status_code == 404:
-        print("✅ Ingen data tilgjengelig for perioden (404 — sannsynligvis helg/helligdag).")
+        # 404 = ingen data for perioden (helg/helligdag) — ikke en feil.
+        print("✅ Ingen data for perioden (404 — helg/helligdag).")
         HOPP_OVER_EXTRACT = True
     else:
         response.raise_for_status()
         data = response.json()
-        antall_serier = len(data.get("data", {}).get("dataSets", [{}])[0].get("series", {}))
+        antall_serier = len(
+            data.get("data", {}).get("dataSets", [{}])[0].get("series", {})
+        )
         print(f"Antall serier i respons: {antall_serier}")
 
         if antall_serier == 0:
             if LASTETYPE == "full":
+                # Ingen data på full last er uventet — sannsynlig feilkonfigurasjon.
                 raise ValueError(
-                    f"Ingen data returnert for full last, periode {START_PERIODE} "
-                    f"til {SLUTT_PERIODE}. Sjekk VALUTAER og START_PERIODE."
+                    f"Ingen data for full last, periode {START_PERIODE}–{SLUTT_PERIODE}. "
+                    "Sjekk VALUTAER og START_PERIODE."
                 )
             else:
+                # Ingen nye observasjoner på inkrementell — normalt for korte perioder.
                 print("✅ Ingen nye observasjoner i perioden.")
                 HOPP_OVER_EXTRACT = True
 
 if not HOPP_OVER_EXTRACT:
+    # Timestamp i filnavnet sikrer unikhet selv ved gjenkjøring samme dag.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filnavn = f"valutakurser_{LASTETYPE}_{SLUTT_PERIODE}_{timestamp}.json"
     filsti  = f"{LANDING_PATH}/{filnavn}"
-    dbutils.fs.put(filsti, json.dumps(data, ensure_ascii=False), overwrite=False)
-    print(f"✅ Lagret rådata ({LASTETYPE}) til: {filsti}")
-else:
-    print("ℹ️ Extract-steget produserte ingen ny fil i landing-sonen denne kjøringen.")
 
-print("\n" + "=" * 65)
-print(f"EXTRACT FULLFØRT — lastetype denne kjøringen: {LASTETYPE.upper()}")
-print("Neste Task i jobben: DLT-pipelinen leser landing-sonen og")
-print(f"skriver til {TABELLNAVN}.")
-print("=" * 65)
+    # overwrite=False: feiler eksplisitt ved navnekollisjon (svært usannsynlig).
+    dbutils.fs.put(filsti, json.dumps(data, ensure_ascii=False), overwrite=False)
+    print(f"✅ Lagret rådata til: {filsti}")
+else:
+    print("ℹ️ Ingen ny fil produsert denne kjøringen.")
+
+print(f"\nEXTRACT FULLFØRT — lastetype: {LASTETYPE.upper()}")
+print(f"Neste task: DLT-pipelinen leser {LANDING_PATH} → {TABELLNAVN}")
 
 # -----------------------------------------------------------------
-# Om DEL 5/6 fra original-jobben (kolonnekommentarer og
-# sensitivitets-tag på bronse-tabellen):
-# - Tabellkommentar og tabell-tag ('sensitivitet'='Offentlig') er
-#   satt direkte i DLT-pipelinen (comment= / table_properties= på
-#   dlt.create_streaming_table), så de trenger ikke gjentas her.
-# - Per-kolonne COMMENT (ALTER TABLE ... ALTER COLUMN ... COMMENT)
-#   støttes ikke direkte i DLT sin Python-API. Ønsker dere det, kan
-#   dere legge til et lite ETTERFØLGENDE Task nr. 3 i jobben (etter
-#   DLT-pipelinen) som bare kjører DEL 5-blokken fra original-koden
-#   mot {KATALOG}.dlt_bronse.valutakurs.
+# VIDERE PROSESS (Task 2):
+# DLT-pipelinen leser landing-sonen via Auto Loader, flater ut
+# SDMX-JSON-strukturen, kjører Expectations (harde + myke regler)
+# og skriver til bronse-tabellen via dlt.apply_changes (SCD Type 1).
+# Kolonnekommentarer kan legges til i en valgfri Task 3 etter DLT.
 # -----------------------------------------------------------------
