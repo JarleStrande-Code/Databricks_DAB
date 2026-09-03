@@ -1,12 +1,11 @@
+# Databricks notebook source
 # =================================================================
 # TASK 1/2: Henter valutakurser fra Norges Bank → landing-sonen
 # Neste task (DLT-pipelinen) leser landing-sonen og skriver til bronse.
 # =================================================================
-
 import requests
 import json
 from datetime import date, datetime, timedelta
-
 
 # -----------------------------------------------------------------
 # DEL 1: PARAMETERE
